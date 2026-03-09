@@ -1,0 +1,44 @@
+{
+  "name": "uf-navigator-mcp",
+  "version": "1.0.0",
+  "description": "MCP server exposing UF NaviGator AI as Claude Code tools",
+  "type": "module",
+  "main": "dist/server.js",
+  "bin": {
+    "uf-navigator-mcp": "dist/server.js"
+  },
+  "files": [
+    "dist/",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/server.ts",
+    "start": "node dist/server.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "smoke": "tsx tests/smoke.ts",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": ["mcp", "uf-navigator", "ai"],
+  "author": "Tianxin Zou",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/zoutianxin1/uf-navigator-mcp.git"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.26.0",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/node": "^25.2.3",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.18"
+  }
+}

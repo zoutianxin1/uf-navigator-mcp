@@ -1,0 +1,26 @@
+# Build output
+dist/
+*.js.map
+
+# Dependencies
+node_modules/
+
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+*.local.*
+*key*
+*secret*
+*token*
+
+# Config dir (outside repo anyway, but just in case)
+~/.config/uf-navigator-mcp/**
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
