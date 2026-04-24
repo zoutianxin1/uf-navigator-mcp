@@ -37,10 +37,37 @@ export interface ListFilter {
 
 const CONFIG_DIR = getConfigDir();
 const MODELS_FILE = join(CONFIG_DIR, "models.json");
+const ALLOWLIST_FILE = join(CONFIG_DIR, "allowlist.json");
 const CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour default
 
 function ensureConfigDir(): void {
   mkdirSync(CONFIG_DIR, { recursive: true });
+}
+
+// ── Allowlist ─────────────────────────────────────────────────────────────────
+
+function readAllowlist(): Set<string> | null {
+  if (!existsSync(ALLOWLIST_FILE)) return null;
+  try {
+    const raw = JSON.parse(readFileSync(ALLOWLIST_FILE, "utf8")) as string[];
+    if (!Array.isArray(raw)) return null;
+    return new Set(raw.map((id) => id.toLowerCase()));
+  } catch {
+    return null;
+  }
+}
+
+function applyAllowlist(models: NavigatorModel[]): NavigatorModel[] {
+  const allowed = readAllowlist();
+  if (!allowed) return models; // no allowlist → pass through all
+  return models.filter((m) => allowed.has(m.id.toLowerCase()));
+}
+
+/** Check whether a model ID is permitted by the allowlist (or if no allowlist, all are permitted). */
+export function isModelAllowed(id: string): boolean {
+  const allowed = readAllowlist();
+  if (!allowed) return true;
+  return allowed.has(id.toLowerCase());
 }
 
 // ── Cache I/O ─────────────────────────────────────────────────────────────────
@@ -100,7 +127,7 @@ export async function listModels(opts: {
     cache = readCache()!;
   }
 
-  let models = cache.models;
+  let models = applyAllowlist(cache.models);
 
   if (filter) {
     if (filter.provider) {

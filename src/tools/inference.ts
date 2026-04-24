@@ -2,6 +2,11 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { resolveModel } from "../navigator/aliases.js";
 import { navigatorFetch, navigatorJSON } from "../navigator/client.js";
+import { isModelAllowed } from "../navigator/modelsCache.js";
+import {
+  applyThinkingEffort,
+  defaultEffortFor,
+} from "../navigator/thinking.js";
 
 export function registerInferenceTools(server: McpServer): void {
   // ── Chat completions ───────────────────────────────────────────────────────
@@ -38,9 +43,24 @@ export function registerInferenceTools(server: McpServer): void {
         .optional()
         .default(false)
         .describe("Stream the response (returns full text when done)"),
+      thinking_effort: z
+        .string()
+        .optional()
+        .describe(
+          "Reasoning/thinking effort level. Defaults per family: OpenAI=xhigh, Gemini=high, Claude 4.7=xhigh, older Claude=high. " +
+            "Allowed values — OpenAI GPT: low|medium|high|xhigh. " +
+            "Google Gemini: none|minimal|low|medium|high|disable. " +
+            "Anthropic Opus 4.7: low|medium|high|xhigh|max. " +
+            "Anthropic Opus/Sonnet 4.6: low|medium|high|max (no xhigh). " +
+            "Older Claude 4.x: low|medium|high. " +
+            "Other models: passed through as reasoning_effort without validation.",
+        ),
     },
     async (args) => {
       const { resolvedModel } = resolveModel(args.model_or_alias);
+      if (!isModelAllowed(resolvedModel)) {
+        return { content: [{ type: "text", text: `Model "${resolvedModel}" is not in the allowlist. Run navigator_list_models to see available models.` }] };
+      }
 
       const body: Record<string, unknown> = {
         model: resolvedModel,
@@ -48,6 +68,17 @@ export function registerInferenceTools(server: McpServer): void {
       };
       if (args.temperature !== undefined) body.temperature = args.temperature;
       if (args.max_tokens !== undefined) body.max_tokens = args.max_tokens;
+
+      const effort = args.thinking_effort ?? defaultEffortFor(resolvedModel);
+      if (effort !== undefined) {
+        try {
+          applyThinkingEffort(body, resolvedModel, effort);
+        } catch (e) {
+          return {
+            content: [{ type: "text", text: (e as Error).message }],
+          };
+        }
+      }
 
       if (args.stream) {
         body.stream = true;
@@ -123,6 +154,9 @@ export function registerInferenceTools(server: McpServer): void {
     },
     async (args) => {
       const { resolvedModel } = resolveModel(args.model_or_alias);
+      if (!isModelAllowed(resolvedModel)) {
+        return { content: [{ type: "text", text: `Model "${resolvedModel}" is not in the allowlist. Run navigator_list_models to see available models.` }] };
+      }
 
       const result = await navigatorJSON<{
         data: Array<{ embedding: number[]; index: number }>;
@@ -192,6 +226,9 @@ export function registerInferenceTools(server: McpServer): void {
     },
     async (args) => {
       const { resolvedModel } = resolveModel(args.model_or_alias);
+      if (!isModelAllowed(resolvedModel)) {
+        return { content: [{ type: "text", text: `Model "${resolvedModel}" is not in the allowlist. Run navigator_list_models to see available models.` }] };
+      }
 
       const result = await navigatorJSON<{
         data: Array<{ url?: string; b64_json?: string; revised_prompt?: string }>;
@@ -247,6 +284,9 @@ export function registerInferenceTools(server: McpServer): void {
     },
     async (args) => {
       const { resolvedModel } = resolveModel(args.model_or_alias);
+      if (!isModelAllowed(resolvedModel)) {
+        return { content: [{ type: "text", text: `Model "${resolvedModel}" is not in the allowlist. Run navigator_list_models to see available models.` }] };
+      }
 
       // Build a multipart/form-data body manually
       const boundary = `----FormBoundary${Math.random().toString(36).slice(2)}`;
@@ -318,6 +358,9 @@ export function registerInferenceTools(server: McpServer): void {
     },
     async (args) => {
       const { resolvedModel } = resolveModel(args.model_or_alias);
+      if (!isModelAllowed(resolvedModel)) {
+        return { content: [{ type: "text", text: `Model "${resolvedModel}" is not in the allowlist. Run navigator_list_models to see available models.` }] };
+      }
 
       const resp = await navigatorFetch(
         "/audio/speech",
