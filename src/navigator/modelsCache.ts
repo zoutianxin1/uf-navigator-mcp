@@ -114,12 +114,24 @@ export async function refreshModels(): Promise<RefreshResult> {
   return { count: models.length, added, removed, fetchedAt: cache.fetchedAt };
 }
 
-/** Return cached model list; optionally refresh if stale or forced. */
+/**
+ * Return cached model list.
+ *
+ * `apply_allowlist` (default true) decides whether `{configDir}/allowlist.json`
+ * filters the result. User-facing callers (the `navigator_list_models` tool,
+ * `navigator_health_check`) keep the filter on so users see only what they've
+ * opted in to. Internal existence probes (`getModelById`, `modelExists`) pass
+ * `false` — they should see the full gateway catalog so alias creation for a
+ * valid-but-not-yet-allowlisted model doesn't spuriously warn "not found in
+ * cache". The inference-path allowlist check lives separately in
+ * `isModelAllowed` and is unaffected.
+ */
 export async function listModels(opts: {
   use_cache?: boolean;
   filter?: ListFilter;
+  apply_allowlist?: boolean;
 } = {}): Promise<NavigatorModel[]> {
-  const { use_cache = true, filter } = opts;
+  const { use_cache = true, filter, apply_allowlist = true } = opts;
 
   let cache = readCache();
   if (!cache || !use_cache || !isFresh(cache)) {
@@ -127,7 +139,7 @@ export async function listModels(opts: {
     cache = readCache()!;
   }
 
-  let models = applyAllowlist(cache.models);
+  let models = apply_allowlist ? applyAllowlist(cache.models) : cache.models;
 
   if (filter) {
     if (filter.provider) {
@@ -154,15 +166,21 @@ export async function listModels(opts: {
   return models;
 }
 
-/** Look up a single model by exact ID in the cache. */
+/**
+ * Look up a single model by exact ID in the cache.
+ *
+ * Bypasses the allowlist so existence queries reflect the full gateway
+ * catalog. Do NOT use this to decide whether a request is permitted — use
+ * `isModelAllowed` for that.
+ */
 export async function getModelById(
   id: string,
 ): Promise<NavigatorModel | null> {
-  const models = await listModels({ use_cache: true });
+  const models = await listModels({ use_cache: true, apply_allowlist: false });
   return models.find((m) => m.id === id) ?? null;
 }
 
-/** Return true if the model id exists in the cache (for alias validation). */
+/** Return true if the model id exists in the gateway catalog (allowlist-agnostic). For permission checks use `isModelAllowed`. */
 export async function modelExists(id: string): Promise<boolean> {
   const m = await getModelById(id);
   return m !== null;
