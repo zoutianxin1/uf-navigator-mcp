@@ -5,7 +5,8 @@ import { navigatorFetch, navigatorJSON } from "../navigator/client.js";
 import { isModelAllowed } from "../navigator/modelsCache.js";
 import {
   applyThinkingEffort,
-  defaultEffortFor,
+  buildDecisionRequiredText,
+  resolveThinkingEffort,
 } from "../navigator/thinking.js";
 
 export function registerInferenceTools(server: McpServer): void {
@@ -47,13 +48,14 @@ export function registerInferenceTools(server: McpServer): void {
         .string()
         .optional()
         .describe(
-          "Reasoning/thinking effort level. Defaults per family: OpenAI=xhigh, Gemini=high, Claude 4.7=xhigh, older Claude=high. " +
-            "Allowed values — OpenAI GPT: low|medium|high|xhigh. " +
-            "Google Gemini: none|minimal|low|medium|high|disable. " +
-            "Anthropic Opus 4.7: low|medium|high|xhigh|max. " +
-            "Anthropic Opus/Sonnet 4.6: low|medium|high|max (no xhigh). " +
-            "Older Claude 4.x: low|medium|high. " +
-            "Other models: passed through as reasoning_effort without validation.",
+          "Reasoning/thinking effort level (optional). Resolution order: " +
+            "(1) this explicit value, if set; (2) the per-model default in " +
+            "{configDir}/model_configs/{model}.json; (3) status-quo seed for " +
+            "gpt-5.X / opus-4.7 / gemini-3.X; (4) otherwise the call returns " +
+            "THINKING_EFFORT_DECISION_REQUIRED and DOES NOT hit the gateway — " +
+            "configure via navigator_manage_thinking_defaults. " +
+            "Allowed values depend on the model (see the per-model file). " +
+            "Pass \"not_applicable\" to skip the effort field entirely for one call.",
         ),
     },
     async (args) => {
@@ -69,16 +71,24 @@ export function registerInferenceTools(server: McpServer): void {
       if (args.temperature !== undefined) body.temperature = args.temperature;
       if (args.max_tokens !== undefined) body.max_tokens = args.max_tokens;
 
-      const effort = args.thinking_effort ?? defaultEffortFor(resolvedModel);
-      if (effort !== undefined) {
+      const resolution = resolveThinkingEffort(resolvedModel, args.thinking_effort);
+      if (resolution.kind === "prompt") {
+        return {
+          content: [
+            { type: "text", text: buildDecisionRequiredText(resolution) },
+          ],
+        };
+      }
+      if (resolution.kind === "apply") {
         try {
-          applyThinkingEffort(body, resolvedModel, effort);
+          applyThinkingEffort(body, resolution.effort, resolution.field);
         } catch (e) {
           return {
             content: [{ type: "text", text: (e as Error).message }],
           };
         }
       }
+      // resolution.kind === "skip" → leave body as-is.
 
       if (args.stream) {
         body.stream = true;
