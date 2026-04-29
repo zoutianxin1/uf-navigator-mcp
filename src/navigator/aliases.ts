@@ -14,8 +14,13 @@ export interface ResolveResult {
 }
 
 // ── Paths ─────────────────────────────────────────────────────────────────────
+//
+// Resolved on every call so `setConfigDirOverride` (used by the test suite)
+// actually redirects file I/O.
 
-const ALIASES_FILE = join(getConfigDir(), "aliases.json");
+function aliasesFile(): string {
+  return join(getConfigDir(), "aliases.json");
+}
 
 function ensureConfigDir(): void {
   mkdirSync(getConfigDir(), { recursive: true });
@@ -24,9 +29,10 @@ function ensureConfigDir(): void {
 // ── I/O ───────────────────────────────────────────────────────────────────────
 
 function readAliasFile(): AliasMap | null {
-  if (!existsSync(ALIASES_FILE)) return null;
+  const file = aliasesFile();
+  if (!existsSync(file)) return null;
   try {
-    return JSON.parse(readFileSync(ALIASES_FILE, "utf8")) as AliasMap;
+    return JSON.parse(readFileSync(file, "utf8")) as AliasMap;
   } catch {
     return null;
   }
@@ -34,14 +40,14 @@ function readAliasFile(): AliasMap | null {
 
 function writeAliasFile(aliases: AliasMap): void {
   ensureConfigDir();
-  atomicWriteFileSync(ALIASES_FILE, JSON.stringify(aliases, null, 2));
+  atomicWriteFileSync(aliasesFile(), JSON.stringify(aliases, null, 2));
 }
 
 // ── Seeding ───────────────────────────────────────────────────────────────────
 
 /** Create empty aliases file if none exists. No-op if file already present. */
 export function seedDefaultAliases(): void {
-  if (!existsSync(ALIASES_FILE)) {
+  if (!existsSync(aliasesFile())) {
     writeAliasFile({});
   }
 }

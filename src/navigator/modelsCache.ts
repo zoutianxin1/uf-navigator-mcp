@@ -34,27 +34,77 @@ export interface ListFilter {
 }
 
 // ── Paths ─────────────────────────────────────────────────────────────────────
+//
+// Resolve the config dir on every call so `setConfigDirOverride` (used by the
+// test suite) actually redirects file I/O. Caching these as module-level
+// constants would freeze them at import time, before any test override runs.
 
-const CONFIG_DIR = getConfigDir();
-const MODELS_FILE = join(CONFIG_DIR, "models.json");
-const ALLOWLIST_FILE = join(CONFIG_DIR, "allowlist.json");
 const CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour default
 
+function modelsFile(): string {
+  return join(getConfigDir(), "models.json");
+}
+
+function allowlistFile(): string {
+  return join(getConfigDir(), "allowlist.json");
+}
+
 function ensureConfigDir(): void {
-  mkdirSync(CONFIG_DIR, { recursive: true });
+  mkdirSync(getConfigDir(), { recursive: true });
 }
 
 // ── Allowlist ─────────────────────────────────────────────────────────────────
+//
+// The allowlist is read on every inference-path call (chat / embeddings / image
+// / STT / TTS), so we cache the parsed Set in memory with a short TTL. The file
+// is typically static; 60s is well below user perception for "I just edited
+// allowlist.json" while eliminating disk I/O on hot paths.
+//
+// Both the populated state and the "no file" state are cached, so the
+// existsSync hit also amortizes. A malformed JSON file fails open (no
+// allowlist) but emits a stderr warning so operators notice.
 
-function readAllowlist(): Set<string> | null {
-  if (!existsSync(ALLOWLIST_FILE)) return null;
+interface AllowlistCacheEntry {
+  set: Set<string> | null;
+  loadedAt: number;
+}
+
+const ALLOWLIST_TTL_MS = 60 * 1000;
+let allowlistCache: AllowlistCacheEntry | null = null;
+
+/** Force the next allowlist read to hit disk. Called by tests and `clearModelsCache`. */
+export function clearAllowlistCache(): void {
+  allowlistCache = null;
+}
+
+function readAllowlistFromDisk(): Set<string> | null {
+  const file = allowlistFile();
+  if (!existsSync(file)) return null;
   try {
-    const raw = JSON.parse(readFileSync(ALLOWLIST_FILE, "utf8")) as string[];
-    if (!Array.isArray(raw)) return null;
-    return new Set(raw.map((id) => id.toLowerCase()));
-  } catch {
+    const raw = JSON.parse(readFileSync(file, "utf8")) as unknown;
+    if (!Array.isArray(raw) || !raw.every((id) => typeof id === "string")) {
+      process.stderr.write(
+        "[uf-navigator] WARNING: allowlist.json must be a JSON array of strings — failing open (all models allowed)\n",
+      );
+      return null;
+    }
+    return new Set((raw as string[]).map((id) => id.toLowerCase()));
+  } catch (err) {
+    process.stderr.write(
+      `[uf-navigator] WARNING: allowlist.json could not be parsed (${(err as Error).message}) — failing open (all models allowed)\n`,
+    );
     return null;
   }
+}
+
+function readAllowlist(): Set<string> | null {
+  const now = Date.now();
+  if (allowlistCache && now - allowlistCache.loadedAt < ALLOWLIST_TTL_MS) {
+    return allowlistCache.set;
+  }
+  const set = readAllowlistFromDisk();
+  allowlistCache = { set, loadedAt: now };
+  return set;
 }
 
 function applyAllowlist(models: NavigatorModel[]): NavigatorModel[] {
@@ -73,9 +123,10 @@ export function isModelAllowed(id: string): boolean {
 // ── Cache I/O ─────────────────────────────────────────────────────────────────
 
 function readCache(): ModelsCache | null {
-  if (!existsSync(MODELS_FILE)) return null;
+  const file = modelsFile();
+  if (!existsSync(file)) return null;
   try {
-    return JSON.parse(readFileSync(MODELS_FILE, "utf8")) as ModelsCache;
+    return JSON.parse(readFileSync(file, "utf8")) as ModelsCache;
   } catch {
     return null;
   }
@@ -83,7 +134,7 @@ function readCache(): ModelsCache | null {
 
 function writeCache(cache: ModelsCache): void {
   ensureConfigDir();
-  atomicWriteFileSync(MODELS_FILE, JSON.stringify(cache, null, 2));
+  atomicWriteFileSync(modelsFile(), JSON.stringify(cache, null, 2));
 }
 
 function isFresh(cache: ModelsCache, ttlMs = CACHE_TTL_MS): boolean {
@@ -186,7 +237,16 @@ export async function modelExists(id: string): Promise<boolean> {
   return m !== null;
 }
 
-/** Delete ONLY the models availability cache (models.json). Does not touch aliases, key, or other state. */
+/**
+ * Delete the models availability cache (models.json) and invalidate the
+ * in-memory allowlist cache. Does not touch aliases, key, or other state.
+ *
+ * The allowlist invalidation is paired here so callers that wipe state after
+ * an API key change (see `health.ts`) don't leave stale allowlist behavior
+ * behind.
+ */
 export function clearModelsCache(): void {
-  if (existsSync(MODELS_FILE)) unlinkSync(MODELS_FILE);
+  const file = modelsFile();
+  if (existsSync(file)) unlinkSync(file);
+  clearAllowlistCache();
 }
