@@ -24,3 +24,6 @@ Thumbs.db
 # Editor
 .vscode/
 .idea/
+
+# Local-only working notes (PR drafts, scratch files)
+notes/
