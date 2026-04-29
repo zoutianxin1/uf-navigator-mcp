@@ -30,6 +30,106 @@ export function buildAllowlistDeniedText(
   return `Model "${resolved}" is not in the allowlist. ${tail}`;
 }
 
+/**
+ * Reasoning field contract (M1):
+ *
+ * - `content` is always present (possibly empty string).
+ * - `model` and `usage` are passed through from the gateway response.
+ * - `reasoning` is OMITTED when the model returns no reasoning content.
+ *   Callers that don't ask for reasoning never see the key appear.
+ *
+ * Streaming and non-streaming responses are structurally identical: both
+ * return `{ content, model, usage, reasoning? }` as a JSON-stringified text
+ * block. This builder enforces that contract once for both paths.
+ */
+export function buildChatResponseJson(parts: {
+  content: string;
+  reasoning?: string;
+  model: string;
+  usage?: unknown;
+}): string {
+  const out: Record<string, unknown> = {
+    content: parts.content,
+    model: parts.model,
+    usage: parts.usage, // JSON.stringify drops undefined keys
+  };
+  if (parts.reasoning && parts.reasoning.length > 0) {
+    out.reasoning = parts.reasoning;
+  }
+  return JSON.stringify(out, null, 2);
+}
+
+/**
+ * Pure SSE parser for `/chat/completions` streams.
+ *
+ * Captures three things the original implementation discarded:
+ *   - `delta.reasoning_content` (OpenAI canonical for o1/o3/gpt-5/Gemini)
+ *   - `delta.thinking?.text` (Anthropic via Bedrock — fallback shape)
+ *   - top-level `model` and `usage` (the latter requires the caller to set
+ *     `stream_options.include_usage: true` on the request)
+ *
+ * Strict null-safety on every concat: SSE parsers routinely emit empty,
+ * null, or partial chunks; naive accumulation throws.
+ */
+export function parseChatStream(
+  rawSseText: string,
+  fallbackModel: string,
+): {
+  content: string;
+  reasoning: string;
+  model: string;
+  usage: unknown;
+} {
+  const contentChunks: string[] = [];
+  const reasoningChunks: string[] = [];
+  let lastModel: string | undefined;
+  let lastUsage: unknown = undefined;
+  for (const line of rawSseText.split("\n")) {
+    if (!line.startsWith("data: ")) continue;
+    const payload = line.slice(6).trim();
+    if (payload === "[DONE]") break;
+    try {
+      const parsed = JSON.parse(payload) as {
+        model?: string;
+        usage?: unknown;
+        choices?: Array<{
+          delta?: {
+            content?: string;
+            reasoning_content?: string;
+            thinking?: { text?: string };
+          };
+        }>;
+      };
+      if (typeof parsed.model === "string") lastModel = parsed.model;
+      if (parsed.usage !== undefined) lastUsage = parsed.usage;
+      const delta = parsed.choices?.[0]?.delta;
+      if (delta) {
+        if (typeof delta.content === "string" && delta.content.length > 0) {
+          contentChunks.push(delta.content);
+        }
+        if (
+          typeof delta.reasoning_content === "string" &&
+          delta.reasoning_content.length > 0
+        ) {
+          reasoningChunks.push(delta.reasoning_content);
+        }
+        const thinkingText = delta.thinking?.text;
+        if (typeof thinkingText === "string" && thinkingText.length > 0) {
+          reasoningChunks.push(thinkingText);
+        }
+      }
+    } catch {
+      // Skip malformed lines.
+    }
+  }
+  return {
+    content: contentChunks.join(""),
+    reasoning: reasoningChunks.join(""),
+    model: lastModel ?? fallbackModel,
+    usage: lastUsage,
+  };
+}
+
 export function registerInferenceTools(server: McpServer): void {
   // ── Chat completions ───────────────────────────────────────────────────────
 
@@ -120,35 +220,44 @@ export function registerInferenceTools(server: McpServer): void {
 
       if (args.stream) {
         body.stream = true;
+        // Opt in to receiving the final usage block on the SSE stream so
+        // the streaming response shape can include `usage` (parity with
+        // the non-streaming branch).
+        body.stream_options = { include_usage: true };
         const resp = await navigatorFetch(
           "/chat/completions",
           { method: "POST", body: JSON.stringify(body) },
           resolvedModel,
         );
         const text = await resp.text();
-        // Collect all SSE data lines and extract content delta chunks
-        const chunks: string[] = [];
-        for (const line of text.split("\n")) {
-          if (!line.startsWith("data: ")) continue;
-          const payload = line.slice(6).trim();
-          if (payload === "[DONE]") break;
-          try {
-            const parsed = JSON.parse(payload) as {
-              choices?: Array<{ delta?: { content?: string } }>;
-            };
-            const delta = parsed.choices?.[0]?.delta?.content;
-            if (delta) chunks.push(delta);
-          } catch {
-            // Skip malformed lines
-          }
-        }
+        const parsed = parseChatStream(text, resolvedModel);
         return {
-          content: [{ type: "text", text: chunks.join("") }],
+          content: [
+            {
+              type: "text",
+              text: buildChatResponseJson({
+                content: parsed.content,
+                reasoning: parsed.reasoning,
+                model: parsed.model,
+                usage: parsed.usage,
+              }),
+            },
+          ],
         };
       }
 
       const result = await navigatorJSON<{
-        choices: Array<{ message: { role: string; content: string } }>;
+        choices: Array<{
+          message: {
+            role: string;
+            content: string;
+            // Reasoning models surface their thinking trace here. LiteLLM
+            // normalizes Anthropic's `thinking` blocks into this field on
+            // the OpenAI-compat path, so we don't need to also probe
+            // `message.thinking`.
+            reasoning_content?: string;
+          };
+        }>;
         usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
         model?: string;
       }>(
@@ -157,20 +266,17 @@ export function registerInferenceTools(server: McpServer): void {
         resolvedModel,
       );
 
-      const assistantMsg = result.choices?.[0]?.message?.content ?? "";
+      const message = result.choices?.[0]?.message;
       return {
         content: [
           {
             type: "text",
-            text: JSON.stringify(
-              {
-                content: assistantMsg,
-                model: result.model ?? resolvedModel,
-                usage: result.usage,
-              },
-              null,
-              2,
-            ),
+            text: buildChatResponseJson({
+              content: message?.content ?? "",
+              reasoning: message?.reasoning_content,
+              model: result.model ?? resolvedModel,
+              usage: result.usage,
+            }),
           },
         ],
       };
