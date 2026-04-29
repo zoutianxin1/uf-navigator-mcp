@@ -9,6 +9,27 @@ import {
   resolveThinkingEffort,
 } from "../navigator/thinking.js";
 
+/**
+ * Render an allowlist-denial message for an inference tool.
+ *
+ * When the user passed an alias and the resolved model differs from it, surface
+ * both the alias and the resolved id (e.g. `Alias "latest_anthropic" →
+ * "claude-4.7-opus" is not in the allowlist`). For literal model ids, surface
+ * just the id. This avoids the case where a user passes "latest_anthropic"
+ * and gets back an error mentioning a Claude version they never typed.
+ */
+export function buildAllowlistDeniedText(
+  input: string,
+  resolved: string,
+  source: "alias" | "literal",
+): string {
+  const tail = "Run navigator_list_models to see available models.";
+  if (source === "alias" && input !== resolved) {
+    return `Alias "${input}" → "${resolved}" is not in the allowlist. ${tail}`;
+  }
+  return `Model "${resolved}" is not in the allowlist. ${tail}`;
+}
+
 export function registerInferenceTools(server: McpServer): void {
   // ── Chat completions ───────────────────────────────────────────────────────
 
@@ -59,9 +80,16 @@ export function registerInferenceTools(server: McpServer): void {
         ),
     },
     async (args) => {
-      const { resolvedModel } = resolveModel(args.model_or_alias);
+      const { resolvedModel, source } = resolveModel(args.model_or_alias);
       if (!isModelAllowed(resolvedModel)) {
-        return { content: [{ type: "text", text: `Model "${resolvedModel}" is not in the allowlist. Run navigator_list_models to see available models.` }] };
+        return {
+          content: [
+            {
+              type: "text",
+              text: buildAllowlistDeniedText(args.model_or_alias, resolvedModel, source),
+            },
+          ],
+        };
       }
 
       const body: Record<string, unknown> = {
@@ -163,9 +191,16 @@ export function registerInferenceTools(server: McpServer): void {
         .describe("Text string or array of strings to embed"),
     },
     async (args) => {
-      const { resolvedModel } = resolveModel(args.model_or_alias);
+      const { resolvedModel, source } = resolveModel(args.model_or_alias);
       if (!isModelAllowed(resolvedModel)) {
-        return { content: [{ type: "text", text: `Model "${resolvedModel}" is not in the allowlist. Run navigator_list_models to see available models.` }] };
+        return {
+          content: [
+            {
+              type: "text",
+              text: buildAllowlistDeniedText(args.model_or_alias, resolvedModel, source),
+            },
+          ],
+        };
       }
 
       const result = await navigatorJSON<{
@@ -235,9 +270,16 @@ export function registerInferenceTools(server: McpServer): void {
         .describe("Image quality"),
     },
     async (args) => {
-      const { resolvedModel } = resolveModel(args.model_or_alias);
+      const { resolvedModel, source } = resolveModel(args.model_or_alias);
       if (!isModelAllowed(resolvedModel)) {
-        return { content: [{ type: "text", text: `Model "${resolvedModel}" is not in the allowlist. Run navigator_list_models to see available models.` }] };
+        return {
+          content: [
+            {
+              type: "text",
+              text: buildAllowlistDeniedText(args.model_or_alias, resolvedModel, source),
+            },
+          ],
+        };
       }
 
       const result = await navigatorJSON<{
@@ -293,9 +335,16 @@ export function registerInferenceTools(server: McpServer): void {
         .describe("Optional language code (e.g. 'en')"),
     },
     async (args) => {
-      const { resolvedModel } = resolveModel(args.model_or_alias);
+      const { resolvedModel, source } = resolveModel(args.model_or_alias);
       if (!isModelAllowed(resolvedModel)) {
-        return { content: [{ type: "text", text: `Model "${resolvedModel}" is not in the allowlist. Run navigator_list_models to see available models.` }] };
+        return {
+          content: [
+            {
+              type: "text",
+              text: buildAllowlistDeniedText(args.model_or_alias, resolvedModel, source),
+            },
+          ],
+        };
       }
 
       // Build a multipart/form-data body manually
@@ -367,9 +416,16 @@ export function registerInferenceTools(server: McpServer): void {
         .describe("Speech speed multiplier"),
     },
     async (args) => {
-      const { resolvedModel } = resolveModel(args.model_or_alias);
+      const { resolvedModel, source } = resolveModel(args.model_or_alias);
       if (!isModelAllowed(resolvedModel)) {
-        return { content: [{ type: "text", text: `Model "${resolvedModel}" is not in the allowlist. Run navigator_list_models to see available models.` }] };
+        return {
+          content: [
+            {
+              type: "text",
+              text: buildAllowlistDeniedText(args.model_or_alias, resolvedModel, source),
+            },
+          ],
+        };
       }
 
       const resp = await navigatorFetch(
