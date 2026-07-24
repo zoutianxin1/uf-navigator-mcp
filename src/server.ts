@@ -10,6 +10,7 @@ import { registerHealthTools } from "./tools/health.js";
 import { registerInferenceTools } from "./tools/inference.js";
 import { registerModelTools } from "./tools/models.js";
 import { registerSpecTools } from "./tools/specs.js";
+import { registerThinkingDefaultTools } from "./tools/thinkingDefaults.js";
 
 // ── Create server ─────────────────────────────────────────────────────────────
 
@@ -26,6 +27,7 @@ registerAliasTools(server);
 registerSpecTools(server);
 registerComplianceTools(server);
 registerInferenceTools(server);
+registerThinkingDefaultTools(server);
 
 // ── Startup ───────────────────────────────────────────────────────────────────
 

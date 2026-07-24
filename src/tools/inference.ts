@@ -2,6 +2,133 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { resolveModel } from "../navigator/aliases.js";
 import { navigatorFetch, navigatorJSON } from "../navigator/client.js";
+import { isModelAllowed } from "../navigator/modelsCache.js";
+import {
+  applyThinkingEffort,
+  buildDecisionRequiredText,
+  resolveThinkingEffort,
+} from "../navigator/thinking.js";
+
+/**
+ * Render an allowlist-denial message for an inference tool.
+ *
+ * When the user passed an alias and the resolved model differs from it, surface
+ * both the alias and the resolved id (e.g. `Alias "latest_anthropic" →
+ * "claude-4.7-opus" is not in the allowlist`). For literal model ids, surface
+ * just the id. This avoids the case where a user passes "latest_anthropic"
+ * and gets back an error mentioning a Claude version they never typed.
+ */
+export function buildAllowlistDeniedText(
+  input: string,
+  resolved: string,
+  source: "alias" | "literal",
+): string {
+  const tail = "Run navigator_list_models to see available models.";
+  if (source === "alias" && input !== resolved) {
+    return `Alias "${input}" → "${resolved}" is not in the allowlist. ${tail}`;
+  }
+  return `Model "${resolved}" is not in the allowlist. ${tail}`;
+}
+
+/**
+ * Reasoning field contract (M1):
+ *
+ * - `content` is always present (possibly empty string).
+ * - `model` and `usage` are passed through from the gateway response.
+ * - `reasoning` is OMITTED when the model returns no reasoning content.
+ *   Callers that don't ask for reasoning never see the key appear.
+ *
+ * Streaming and non-streaming responses are structurally identical: both
+ * return `{ content, model, usage, reasoning? }` as a JSON-stringified text
+ * block. This builder enforces that contract once for both paths.
+ */
+export function buildChatResponseJson(parts: {
+  content: string;
+  reasoning?: string;
+  model: string;
+  usage?: unknown;
+}): string {
+  const out: Record<string, unknown> = {
+    content: parts.content,
+    model: parts.model,
+    usage: parts.usage, // JSON.stringify drops undefined keys
+  };
+  if (parts.reasoning && parts.reasoning.length > 0) {
+    out.reasoning = parts.reasoning;
+  }
+  return JSON.stringify(out, null, 2);
+}
+
+/**
+ * Pure SSE parser for `/chat/completions` streams.
+ *
+ * Captures three things the original implementation discarded:
+ *   - `delta.reasoning_content` (OpenAI canonical for o1/o3/gpt-5/Gemini)
+ *   - `delta.thinking?.text` (Anthropic via Bedrock — fallback shape)
+ *   - top-level `model` and `usage` (the latter requires the caller to set
+ *     `stream_options.include_usage: true` on the request)
+ *
+ * Strict null-safety on every concat: SSE parsers routinely emit empty,
+ * null, or partial chunks; naive accumulation throws.
+ */
+export function parseChatStream(
+  rawSseText: string,
+  fallbackModel: string,
+): {
+  content: string;
+  reasoning: string;
+  model: string;
+  usage: unknown;
+} {
+  const contentChunks: string[] = [];
+  const reasoningChunks: string[] = [];
+  let lastModel: string | undefined;
+  let lastUsage: unknown = undefined;
+  for (const line of rawSseText.split("\n")) {
+    if (!line.startsWith("data: ")) continue;
+    const payload = line.slice(6).trim();
+    if (payload === "[DONE]") break;
+    try {
+      const parsed = JSON.parse(payload) as {
+        model?: string;
+        usage?: unknown;
+        choices?: Array<{
+          delta?: {
+            content?: string;
+            reasoning_content?: string;
+            thinking?: { text?: string };
+          };
+        }>;
+      };
+      if (typeof parsed.model === "string") lastModel = parsed.model;
+      if (parsed.usage !== undefined) lastUsage = parsed.usage;
+      const delta = parsed.choices?.[0]?.delta;
+      if (delta) {
+        if (typeof delta.content === "string" && delta.content.length > 0) {
+          contentChunks.push(delta.content);
+        }
+        if (
+          typeof delta.reasoning_content === "string" &&
+          delta.reasoning_content.length > 0
+        ) {
+          reasoningChunks.push(delta.reasoning_content);
+        }
+        const thinkingText = delta.thinking?.text;
+        if (typeof thinkingText === "string" && thinkingText.length > 0) {
+          reasoningChunks.push(thinkingText);
+        }
+      }
+    } catch {
+      // Skip malformed lines.
+    }
+  }
+  return {
+    content: contentChunks.join(""),
+    reasoning: reasoningChunks.join(""),
+    model: lastModel ?? fallbackModel,
+    usage: lastUsage,
+  };
+}
 
 export function registerInferenceTools(server: McpServer): void {
   // ── Chat completions ───────────────────────────────────────────────────────
@@ -38,9 +165,32 @@ export function registerInferenceTools(server: McpServer): void {
         .optional()
         .default(false)
         .describe("Stream the response (returns full text when done)"),
+      thinking_effort: z
+        .string()
+        .optional()
+        .describe(
+          "Reasoning/thinking effort level (optional). Resolution order: " +
+            "(1) this explicit value, if set; (2) the per-model default in " +
+            "{configDir}/model_configs/{model}.json; (3) status-quo seed for " +
+            "gpt-5.X / opus-4.7 / gemini-3.X; (4) otherwise the call returns " +
+            "THINKING_EFFORT_DECISION_REQUIRED and DOES NOT hit the gateway — " +
+            "configure via navigator_manage_thinking_defaults. " +
+            "Allowed values depend on the model (see the per-model file). " +
+            "Pass \"not_applicable\" to skip the effort field entirely for one call.",
+        ),
     },
     async (args) => {
-      const { resolvedModel } = resolveModel(args.model_or_alias);
+      const { resolvedModel, source } = resolveModel(args.model_or_alias);
+      if (!isModelAllowed(resolvedModel)) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: buildAllowlistDeniedText(args.model_or_alias, resolvedModel, source),
+            },
+          ],
+        };
+      }
 
       const body: Record<string, unknown> = {
         model: resolvedModel,
@@ -49,37 +199,65 @@ export function registerInferenceTools(server: McpServer): void {
       if (args.temperature !== undefined) body.temperature = args.temperature;
       if (args.max_tokens !== undefined) body.max_tokens = args.max_tokens;
 
+      const resolution = resolveThinkingEffort(resolvedModel, args.thinking_effort);
+      if (resolution.kind === "prompt") {
+        return {
+          content: [
+            { type: "text", text: buildDecisionRequiredText(resolution) },
+          ],
+        };
+      }
+      if (resolution.kind === "apply") {
+        try {
+          applyThinkingEffort(body, resolution.effort, resolution.field);
+        } catch (e) {
+          return {
+            content: [{ type: "text", text: (e as Error).message }],
+          };
+        }
+      }
+      // resolution.kind === "skip" → leave body as-is.
+
       if (args.stream) {
         body.stream = true;
+        // Opt in to receiving the final usage block on the SSE stream so
+        // the streaming response shape can include `usage` (parity with
+        // the non-streaming branch).
+        body.stream_options = { include_usage: true };
         const resp = await navigatorFetch(
           "/chat/completions",
           { method: "POST", body: JSON.stringify(body) },
           resolvedModel,
         );
         const text = await resp.text();
-        // Collect all SSE data lines and extract content delta chunks
-        const chunks: string[] = [];
-        for (const line of text.split("\n")) {
-          if (!line.startsWith("data: ")) continue;
-          const payload = line.slice(6).trim();
-          if (payload === "[DONE]") break;
-          try {
-            const parsed = JSON.parse(payload) as {
-              choices?: Array<{ delta?: { content?: string } }>;
-            };
-            const delta = parsed.choices?.[0]?.delta?.content;
-            if (delta) chunks.push(delta);
-          } catch {
-            // Skip malformed lines
-          }
-        }
+        const parsed = parseChatStream(text, resolvedModel);
         return {
-          content: [{ type: "text", text: chunks.join("") }],
+          content: [
+            {
+              type: "text",
+              text: buildChatResponseJson({
+                content: parsed.content,
+                reasoning: parsed.reasoning,
+                model: parsed.model,
+                usage: parsed.usage,
+              }),
+            },
+          ],
         };
       }
 
       const result = await navigatorJSON<{
-        choices: Array<{ message: { role: string; content: string } }>;
+        choices: Array<{
+          message: {
+            role: string;
+            content: string;
+            // Reasoning models surface their thinking trace here. LiteLLM
+            // normalizes Anthropic's `thinking` blocks into this field on
+            // the OpenAI-compat path, so we don't need to also probe
+            // `message.thinking`.
+            reasoning_content?: string;
+          };
+        }>;
         usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
         model?: string;
       }>(
@@ -88,20 +266,17 @@ export function registerInferenceTools(server: McpServer): void {
         resolvedModel,
       );
 
-      const assistantMsg = result.choices?.[0]?.message?.content ?? "";
+      const message = result.choices?.[0]?.message;
       return {
         content: [
           {
             type: "text",
-            text: JSON.stringify(
-              {
-                content: assistantMsg,
-                model: result.model ?? resolvedModel,
-                usage: result.usage,
-              },
-              null,
-              2,
-            ),
+            text: buildChatResponseJson({
+              content: message?.content ?? "",
+              reasoning: message?.reasoning_content,
+              model: result.model ?? resolvedModel,
+              usage: result.usage,
+            }),
           },
         ],
       };
@@ -122,7 +297,17 @@ export function registerInferenceTools(server: McpServer): void {
         .describe("Text string or array of strings to embed"),
     },
     async (args) => {
-      const { resolvedModel } = resolveModel(args.model_or_alias);
+      const { resolvedModel, source } = resolveModel(args.model_or_alias);
+      if (!isModelAllowed(resolvedModel)) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: buildAllowlistDeniedText(args.model_or_alias, resolvedModel, source),
+            },
+          ],
+        };
+      }
 
       const result = await navigatorJSON<{
         data: Array<{ embedding: number[]; index: number }>;
@@ -191,7 +376,17 @@ export function registerInferenceTools(server: McpServer): void {
         .describe("Image quality"),
     },
     async (args) => {
-      const { resolvedModel } = resolveModel(args.model_or_alias);
+      const { resolvedModel, source } = resolveModel(args.model_or_alias);
+      if (!isModelAllowed(resolvedModel)) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: buildAllowlistDeniedText(args.model_or_alias, resolvedModel, source),
+            },
+          ],
+        };
+      }
 
       const result = await navigatorJSON<{
         data: Array<{ url?: string; b64_json?: string; revised_prompt?: string }>;
@@ -246,7 +441,17 @@ export function registerInferenceTools(server: McpServer): void {
         .describe("Optional language code (e.g. 'en')"),
     },
     async (args) => {
-      const { resolvedModel } = resolveModel(args.model_or_alias);
+      const { resolvedModel, source } = resolveModel(args.model_or_alias);
+      if (!isModelAllowed(resolvedModel)) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: buildAllowlistDeniedText(args.model_or_alias, resolvedModel, source),
+            },
+          ],
+        };
+      }
 
       // Build a multipart/form-data body manually
       const boundary = `----FormBoundary${Math.random().toString(36).slice(2)}`;
@@ -317,7 +522,17 @@ export function registerInferenceTools(server: McpServer): void {
         .describe("Speech speed multiplier"),
     },
     async (args) => {
-      const { resolvedModel } = resolveModel(args.model_or_alias);
+      const { resolvedModel, source } = resolveModel(args.model_or_alias);
+      if (!isModelAllowed(resolvedModel)) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: buildAllowlistDeniedText(args.model_or_alias, resolvedModel, source),
+            },
+          ],
+        };
+      }
 
       const resp = await navigatorFetch(
         "/audio/speech",
